@@ -1,2 +1,4 @@
 # NAPOLEON
-Digital solutions for analysis and optimization of energy consumption
+### Digital solutions for analysis and optimization of energy consumption
+
+The production and distribution of electrical energy is a significant and promising industry important for the whole society. Nowadays, it is possible to observe a rapid transformation of this industry, mainly through the introduction of digitization of processes and the deployment of intelligent distribution networks, known as "smart grids". An important part of intelligent networks are mainly intelligent measuring devices (IMS), which enable the operator of the distribution network to obtain a detailed overview of the consumption of its customers or the operation of the network itself. The goal of the proposed project is to create a digital solution that will enable non-invasive measurement and disaggregation of total electricity consumption to the level of individual types of appliances or categories of appliances. The proposed solution will integrate smart metering devices to monitor electricity consumption in real-time, as well as data analysis and artificial intelligence methods.
