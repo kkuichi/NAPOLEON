@@ -17,7 +17,17 @@ from typing import Any, Dict, Optional, Tuple
 import joblib
 import numpy as np
 import pandas as pd
-import pyarrow.parquet as pq
+from pipeline_io import load_main_table, prepare_time_cols
+from project_paths import dataset_path, prediction_path, model_path
+
+from timeseries_feature_helpers import (
+    count_zeros,
+    diffs_abs_stats,
+    mode_or_nan,
+    p2p,
+    robust_p2p,
+    spikes_count,
+)
 
 EPS_ZERO = 1e-6
 SPIKE_K = 3.0
@@ -27,10 +37,9 @@ MIN_COL_COVERAGE_PER_DAY = 0.60
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_EVAL_PARQUET = BASE_DIR / "Data" / "Eval" / "eval_data_sample_first50_meters_with_eic.parquet"
-DEFAULT_EVAL_CSV = BASE_DIR / "Data" / "Eval" / "eval_data.csv"
-DEFAULT_OUTPUT_CSV = BASE_DIR / "eval_scored_faults_first50_meters.csv"
-DEFAULT_BINARY_ARTIFACT = BASE_DIR / "model_binary_randomforest_with_threshold.joblib"
-DEFAULT_MULTICLASS_ARTIFACT = BASE_DIR / "model_multiclass_randomforest_bundle.joblib"
+DEFAULT_OUTPUT_CSV = prediction_path("eval_scored_faults_first50_meters.csv")
+DEFAULT_BINARY_ARTIFACT = model_path("model_binary_randomforest_with_threshold.joblib")
+DEFAULT_MULTICLASS_ARTIFACT = model_path("model_multiclass_randomforest_bundle.joblib")
 DEFAULT_BINARY_THRESHOLD_OVERRIDE: Optional[float] = None
 
 # Mapovanie class label -> názov typu poruchy pre 2-triedny model
@@ -40,82 +49,6 @@ FAULT_LABEL_NAMES = {1: "prudova", 2: "napatova"}
 # =============================================================================
 # FEATURE HELPERS
 # =============================================================================
-
-def mode_or_nan(s: pd.Series):
-    s = s.dropna()
-    return s.mode().iat[0] if not s.empty else np.nan
-
-
-def p2p(s: pd.Series):
-    s = s.dropna()
-    return (s.max() - s.min()) if not s.empty else np.nan
-
-
-def robust_p2p(series: pd.Series) -> float:
-    s = series.dropna()
-    if s.empty:
-        return np.nan
-    q95 = np.percentile(s, 95)
-    q05 = np.percentile(s, 5)
-    return q95 - q05
-
-
-def count_zeros(series: pd.Series, eps: float = EPS_ZERO) -> int:
-    s = series.dropna()
-    if s.empty:
-        return 0
-    return int((np.abs(s) < eps).sum())
-
-
-def diffs_abs_stats(df_day: pd.DataFrame, col: str, t_col: str) -> tuple:
-    s = df_day[[t_col, col]].dropna().sort_values(t_col)
-    if len(s) < 2:
-        return np.nan, np.nan
-    if MAX_TIME_GAP_MIN is not None:
-        dt = s[t_col].diff().dt.total_seconds().fillna(0) / 60.0
-        diffs = s[col].diff().where(dt <= MAX_TIME_GAP_MIN)
-    else:
-        diffs = s[col].diff()
-    diffs = diffs.dropna().abs()
-    if diffs.empty:
-        return np.nan, np.nan
-    return float(diffs.mean()), float(diffs.max())
-
-
-def mad(x: np.ndarray) -> float:
-    x = x[~np.isnan(x)]
-    if x.size == 0:
-        return np.nan
-    med = np.median(x)
-    return float(np.median(np.abs(x - med)))
-
-
-def spikes_count(series: pd.Series, k: float = SPIKE_K) -> int:
-    s = series.dropna().values
-    if s.size == 0:
-        return 0
-    med = np.median(s)
-    m = mad(s)
-    if not np.isfinite(m) or m == 0:
-        return 0
-    thr = med + k * m
-    return int(np.sum(s > thr))
-
-
-def load_main_table(parquet_path: Path, filters: Optional[list] = None) -> pd.DataFrame:
-    table = pq.read_table(str(parquet_path), filters=filters)
-    return table.to_pandas(types_mapper=None)
-
-
-def load_eval_csv(path: Path) -> pd.DataFrame:
-    return pd.read_csv(path, sep=";")
-
-
-def prepare_time_cols(df: pd.DataFrame, t_col: str = "t_utc") -> pd.DataFrame:
-    out = df.copy()
-    out[t_col] = pd.to_datetime(out[t_col], utc=True, errors="coerce")
-    return out
-
 
 def build_skipped_nan_output_path(output_csv: Path) -> Path:
     return output_csv.with_name(f"{output_csv.stem}_skipped_nan_days.csv")
@@ -502,7 +435,6 @@ def align_features(df: pd.DataFrame, features: list[str]) -> pd.DataFrame:
 
 def score_eval(
     eval_parquet: Path,
-    eval_csv: Path,
     output_csv: Path,
     binary_artifact: Optional[Path] = None,
     multiclass_artifact: Optional[Path] = None,
@@ -514,33 +446,29 @@ def score_eval(
     print("HIERARCHICKÝ SCORING PRE EVAL DÁTA")
     print("=" * 80)
 
-    print(f"\n[1] Načítavam mapovanie EIC: {eval_csv}")
-    eval_meta = load_eval_csv(eval_csv)
-    eval_meta["elektromer"] = pd.to_numeric(eval_meta["elektromer"], errors="coerce")
-    print(f"    ✓ Meta: {eval_meta.shape}")
-
-    eic_to_meter = (
-        eval_meta.dropna(subset=["eic", "elektromer"])
-        .groupby("eic")["elektromer"]
-        .agg(lambda s: s.mode().iat[0] if not s.mode().empty else s.iloc[0])
-        .to_dict()
-    )
-
     raw_filters = None
-    print(f"\n[2] Načítavam raw dáta: {eval_parquet}")
+    print(f"\n[1] Načítavam raw dáta: {eval_parquet}")
     df = load_main_table(eval_parquet, filters=raw_filters)
     print(f"    ✓ Raw dáta: {df.shape}")
 
-    # Sample parquet už obsahuje EIC; fallback je mapovanie cez CSV.
+    # V strict režime berieme EIC aj elektromer priamo z parquetu (bez eval_data.csv).
+    if "elektromer" not in df.columns:
+        raise KeyError("Vstupný parquet neobsahuje stĺpec 'elektromer'.")
+
     df["elektromer"] = pd.to_numeric(df["elektromer"], errors="coerce")
     if "eic" in df.columns:
         df["eic"] = df["eic"]
     elif "EIC" in df.columns:
         df["eic"] = df["EIC"]
     else:
-        eval_meta["elektromer"] = pd.to_numeric(eval_meta["elektromer"], errors="coerce")
-        elm_to_eic = dict(zip(eval_meta["elektromer"], eval_meta["eic"]))
-        df["eic"] = df["elektromer"].map(elm_to_eic)
+        raise KeyError("Vstupný parquet neobsahuje stĺpec 'eic' ani 'EIC'.")
+
+    eic_to_meter = (
+        df.dropna(subset=["eic", "elektromer"])
+        .groupby("eic")["elektromer"]
+        .agg(lambda s: s.mode().iat[0] if not s.mode().empty else s.iloc[0])
+        .to_dict()
+    )
 
     print(f"    Po priradení EIC - df.shape: {df.shape}, eic notna: {df['eic'].notna().sum()}")
 
@@ -557,7 +485,7 @@ def score_eval(
     value_cols = [c for c in ["u1_norm", "u2_norm", "u3_norm", "i1_norm", "i2_norm", "i3_norm"] if c in df.columns]
     skipped_nan_output_csv = build_skipped_nan_output_path(output_csv)
 
-    print(f"\n[3] Filtrujem EIC/deň s priveľa NaN v 10-min meraniach...")
+    print(f"\n[2] Filtrujem EIC/deň s priveľa NaN v 10-min meraniach...")
     df, skipped_nan_days = filter_days_with_excessive_nans(
         df=df,
         eic_col="eic",
@@ -578,7 +506,7 @@ def score_eval(
         print(f"\n✓ Uložené prázdne CSV: {output_csv}")
         return out
 
-    print(f"\n[4] Vytváram denné features...")
+    print(f"\n[3] Vytváram denné features...")
     df_daily = build_daily_features(df, eic_col="eic", t_col="t_utc", u_cols=["u1_norm", "u2_norm", "u3_norm"], i_cols=["i1_norm", "i2_norm", "i3_norm"], typ_col=None)
     print(f"    ✓ Denné features: {df_daily.shape}")
 
@@ -590,11 +518,11 @@ def score_eval(
         print(f"\n✓ Uložené prázdne CSV: {output_csv}")
         return out
 
-    print(f"\n[5] Feature engineering ako pri tréningu...")
+    print(f"\n[4] Feature engineering ako pri tréningu...")
     df_daily = add_engineered_features(df_daily)
     print(f"    ✓ Po engineered features: {df_daily.shape}")
 
-    print(f"\n[6] Filtrácia vysokonapäťových EIC...")
+    print(f"\n[5] Filtrácia vysokonapäťových EIC...")
     before_hv = len(df_daily)
     df_daily = filter_high_voltage_eics(df_daily, threshold=1000.0)
     print(f"    ✓ Riadkov pred HV filtrom: {before_hv}")
@@ -608,7 +536,7 @@ def score_eval(
         print(f"\n✓ Uložené prázdne CSV: {output_csv}")
         return out
 
-    print(f"\n[7] Načítavam binárny model a threshold...")
+    print(f"\n[6] Načítavam binárny model a threshold...")
     binary_model, binary_features, binary_threshold, binary_name = load_binary_artifact(binary_artifact)
     if binary_threshold_override is not None:
         print(f"    ⚙ Threshold z artefaktu ({binary_threshold:.4f}) prepisuje používateľský override: {binary_threshold_override:.4f}")
@@ -654,7 +582,7 @@ def score_eval(
         print(f"\n✓ Uložené prázdne CSV: {output_csv}")
         return out
 
-    print(f"\n[8] Načítavam model typu poruchy...")
+    print(f"\n[7] Načítavam model typu poruchy...")
     multi_model, multi_features, class_labels, multi_name = load_multiclass_artifact(multiclass_artifact)
     print(f"    ✓ Model artifact: {multi_name}")
     print(f"    ✓ Model features: {len(multi_features)}")
@@ -757,7 +685,7 @@ def score_eval(
     write_skipped_nan_report(skipped_report, skipped_nan_output_csv)
     result.to_csv(output_csv, index=False)
 
-    print(f"\n[9] Hotovo")
+    print(f"\n[8] Hotovo")
     print(f"    ✓ Výstupný CSV: {output_csv}")
     print(f"    ✓ Počet predikovaných poruchových intervalov: {len(result)}")
     unique_eics_with_fault = result["EIC"].nunique()
@@ -769,7 +697,6 @@ def score_eval(
 if __name__ == "__main__":
     score_eval(
         eval_parquet=DEFAULT_EVAL_PARQUET,
-        eval_csv=DEFAULT_EVAL_CSV,
         output_csv=DEFAULT_OUTPUT_CSV,
         binary_artifact=DEFAULT_BINARY_ARTIFACT,
         multiclass_artifact=DEFAULT_MULTICLASS_ARTIFACT,
