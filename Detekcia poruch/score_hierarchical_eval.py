@@ -12,22 +12,12 @@ Postup:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 import joblib
 import numpy as np
 import pandas as pd
-from pipeline_io import load_main_table, prepare_time_cols
-from project_paths import dataset_path, prediction_path, model_path
-
-from timeseries_feature_helpers import (
-    count_zeros,
-    diffs_abs_stats,
-    mode_or_nan,
-    p2p,
-    robust_p2p,
-    spikes_count,
-)
+import pyarrow.parquet as pq
 
 EPS_ZERO = 1e-6
 SPIKE_K = 3.0
@@ -35,20 +25,90 @@ MAX_TIME_GAP_MIN: Optional[float] = None
 MAX_NAN_RATIO_PER_DAY = 0.35
 MIN_COL_COVERAGE_PER_DAY = 0.60
 
-BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_EVAL_PARQUET = BASE_DIR / "Data" / "Eval" / "eval_data_sample_first50_meters_with_eic.parquet"
-DEFAULT_OUTPUT_CSV = prediction_path("eval_scored_faults_first50_meters.csv")
-DEFAULT_BINARY_ARTIFACT = model_path("model_binary_randomforest_with_threshold.joblib")
-DEFAULT_MULTICLASS_ARTIFACT = model_path("model_multiclass_randomforest_bundle.joblib")
+# Cesty k datam a modelom
+DEFAULT_EVAL_PARQUET = Path("Data/Eval/eval_data_sample_first50_meters_with_eic.parquet")
+DEFAULT_OUTPUT_CSV = Path("eval_scored_faults_first50_meters.csv")
+DEFAULT_BINARY_ARTIFACT = Path("Models/model_binary_randomforest_with_threshold.joblib")
+DEFAULT_MULTICLASS_ARTIFACT = Path("Models/model_multiclass_randomforest_bundle.joblib")
 DEFAULT_BINARY_THRESHOLD_OVERRIDE: Optional[float] = None
 
 # Mapovanie class label -> názov typu poruchy pre 2-triedny model
 # 1: prudové poruchy, 2: napäťové poruchy
 FAULT_LABEL_NAMES = {1: "prudova", 2: "napatova"}
 
+PathLike = Union[str, Path]
+
+def load_main_table(parquet_path: PathLike, filters: Optional[list] = None) -> pd.DataFrame:
+    table = pq.read_table(str(parquet_path), filters=filters)
+    return table.to_pandas(types_mapper=None)
+
+def prepare_time_cols(df: pd.DataFrame, t_col: str = "t_utc") -> pd.DataFrame:
+    out = df.copy()
+    out[t_col] = pd.to_datetime(out[t_col], utc=True, errors="coerce")
+    return out
+
 # =============================================================================
 # FEATURE HELPERS
 # =============================================================================
+
+def mode_or_nan(s: pd.Series):
+    s = s.dropna()
+    return s.mode().iat[0] if not s.empty else np.nan
+
+def p2p(s: pd.Series):
+    s = s.dropna()
+    return (s.max() - s.min()) if not s.empty else np.nan
+
+def robust_p2p(series: pd.Series) -> float:
+    s = series.dropna()
+    if s.empty:
+        return np.nan
+    q95 = np.percentile(s, 95)
+    q05 = np.percentile(s, 5)
+    return q95 - q05
+
+def count_zeros(series: pd.Series, eps: float = EPS_ZERO) -> int:
+    s = series.dropna()
+    if s.empty:
+        return 0
+    return int((np.abs(s) < eps).sum())
+
+def diffs_abs_stats(
+    df_day: pd.DataFrame,
+    col: str,
+    t_col: str,
+    max_time_gap_min: Optional[float] = MAX_TIME_GAP_MIN,
+) -> tuple:
+    s = df_day[[t_col, col]].dropna().sort_values(t_col)
+    if len(s) < 2:
+        return np.nan, np.nan
+    if max_time_gap_min is not None:
+        dt = s[t_col].diff().dt.total_seconds().fillna(0) / 60.0
+        diffs = s[col].diff().where(dt <= max_time_gap_min)
+    else:
+        diffs = s[col].diff()
+    diffs = diffs.dropna().abs()
+    if diffs.empty:
+        return np.nan, np.nan
+    return float(diffs.mean()), float(diffs.max())
+
+def mad(x: np.ndarray) -> float:
+    x = x[~np.isnan(x)]
+    if x.size == 0:
+        return np.nan
+    med = np.median(x)
+    return float(np.median(np.abs(x - med)))
+
+def spikes_count(series: pd.Series, k: float = SPIKE_K) -> int:
+    s = series.dropna().values
+    if s.size == 0:
+        return 0
+    med = np.median(s)
+    m = mad(s)
+    if not np.isfinite(m) or m == 0:
+        return 0
+    thr = med + k * m
+    return int(np.sum(s > thr))
 
 def build_skipped_nan_output_path(output_csv: Path) -> Path:
     return output_csv.with_name(f"{output_csv.stem}_skipped_nan_days.csv")
@@ -367,16 +427,9 @@ def filter_high_voltage_eics(df: pd.DataFrame, threshold: float = 1000.0) -> pd.
     return d
 
 
-def load_latest_artifact(pattern: str) -> Path:
-    matches = sorted(BASE_DIR.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not matches:
-        raise FileNotFoundError(f"Nenájdený artifact podľa patternu: {pattern}")
-    return matches[0]
-
-
 def load_binary_artifact(path: Optional[Path] = None) -> Tuple[Any, list[str], float, str]:
     if path is None:
-        path = load_latest_artifact("model_binary_*_with_threshold.joblib")
+        raise ValueError("Path k binárnemu modelu nie je OK.")
     obj = joblib.load(path)
     if isinstance(obj, dict):
         model = obj["model"]
@@ -396,11 +449,7 @@ def load_binary_artifact(path: Optional[Path] = None) -> Tuple[Any, list[str], f
 
 def load_multiclass_artifact(path: Optional[Path] = None) -> Tuple[Any, list[str], list[int], str]:
     if path is None:
-        bundle_matches = sorted(BASE_DIR.glob("model_multiclass_*_bundle.joblib"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if bundle_matches:
-            path = bundle_matches[0]
-        else:
-            path = load_latest_artifact("model_multiclass_*.joblib")
+        raise ValueError("Path k modelu typu poruchy nie je OK.")
     obj = joblib.load(path)
 
     if isinstance(obj, dict):
@@ -451,7 +500,7 @@ def score_eval(
     df = load_main_table(eval_parquet, filters=raw_filters)
     print(f"    ✓ Raw dáta: {df.shape}")
 
-    # V strict režime berieme EIC aj elektromer priamo z parquetu (bez eval_data.csv).
+    # Berieme EIC aj elektromer priamo z parquetu
     if "elektromer" not in df.columns:
         raise KeyError("Vstupný parquet neobsahuje stĺpec 'elektromer'.")
 
@@ -588,14 +637,15 @@ def score_eval(
     print(f"    ✓ Model features: {len(multi_features)}")
     print(f"    ✓ Class labels: {class_labels}")
 
-    # Strict kontrola: oba modely musia používať identický feature list.
+    # Každý model sa skóruje na svojom vlastnom (strict) feature sete z trenovania.
+    # Nepoužívame aproximáciu ani dopĺňanie feature nulami.
     if binary_features != multi_features:
         only_binary = [f for f in binary_features if f not in set(multi_features)]
         only_multi = [f for f in multi_features if f not in set(binary_features)]
-        raise RuntimeError(
-            "Strict feature check failed: feature listy modelov sa líšia. "
+        print(
+            "    ⚠ Feature sety modelov sa líšia; pokračujem strict režimom pre každý model zvlášť. "
             f"len(binary)={len(binary_features)}, len(model2)={len(multi_features)}, "
-            f"only_binary(first)={only_binary[:10]}, only_model2(first)={only_multi[:10]}"
+            f"only_binary(first)={only_binary[:5]}, only_model2(first)={only_multi[:5]}"
         )
 
     positives, skipped_multi_feature_days = filter_rows_with_nan_model_features(
